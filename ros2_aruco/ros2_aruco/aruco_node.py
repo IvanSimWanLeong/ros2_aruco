@@ -1,9 +1,9 @@
 """
-This node locates Aruco AR markers in images and publishes their ids and poses.
+This node locates Aruco AR markers in images and publishes their ids, poses,
+and TF transforms.
 
 Subscriptions:
    /camera/image_raw (sensor_msgs.msg.Image)
-   /camera/camera_info (sensor_msgs.msg.CameraInfo)
    /camera/camera_info (sensor_msgs.msg.CameraInfo)
 
 Published Topics:
@@ -14,6 +14,9 @@ Published Topics:
        Provides an array of all poses along with the corresponding
        marker ids.
 
+    /tf (tf2_msgs.msg.TFMessage)
+       Transforms from the camera frame to each detected marker frame.
+
 Parameters:
     marker_size - size of the markers in meters (default .0625)
     aruco_dictionary_id - dictionary that was used to generate markers
@@ -21,10 +24,11 @@ Parameters:
     image_topic - image topic to subscribe to (default /camera/image_raw)
     camera_info_topic - camera info topic to subscribe to
                          (default /camera/camera_info)
+    camera_frame - camera optical frame to use (default "")
+    marker_frame_prefix - prefix for child TF frame names (default "aruco_marker_")
 
 Author: Nathan Sprague
 Version: 10/26/2020
-
 """
 
 import rclpy
@@ -34,9 +38,10 @@ from cv_bridge import CvBridge
 import numpy as np
 import cv2
 import tf_transformations
+from tf2_ros import TransformBroadcaster
 from sensor_msgs.msg import CameraInfo
 from sensor_msgs.msg import Image
-from geometry_msgs.msg import PoseArray, Pose
+from geometry_msgs.msg import PoseArray, Pose, TransformStamped
 from ros2_aruco_interfaces.msg import ArucoMarkers
 from rcl_interfaces.msg import ParameterDescriptor, ParameterType
 
@@ -91,6 +96,15 @@ class ArucoNode(rclpy.node.Node):
             ),
         )
 
+        self.declare_parameter(
+            name="marker_frame_prefix",
+            value="aruco_marker_",
+            descriptor=ParameterDescriptor(
+                type=ParameterType.PARAMETER_STRING,
+                description="Prefix for published marker TF child frame IDs.",
+            ),
+        )
+
         self.marker_size = (
             self.get_parameter("marker_size").get_parameter_value().double_value
         )
@@ -115,6 +129,10 @@ class ArucoNode(rclpy.node.Node):
             self.get_parameter("camera_frame").get_parameter_value().string_value
         )
 
+        self.marker_frame_prefix = (
+            self.get_parameter("marker_frame_prefix").get_parameter_value().string_value
+        )
+
         # Make sure we have a valid dictionary id:
         try:
             dictionary_id = cv2.aruco.__getattribute__(dictionary_id_name)
@@ -136,17 +154,18 @@ class ArucoNode(rclpy.node.Node):
             Image, image_topic, self.image_callback, qos_profile_sensor_data
         )
 
-        # Set up publishers
+        # Set up publishers and TF broadcaster
         self.poses_pub = self.create_publisher(PoseArray, "aruco_poses", 10)
         self.markers_pub = self.create_publisher(ArucoMarkers, "aruco_markers", 10)
+        self.tf_broadcaster = TransformBroadcaster(self)
 
         # Set up fields for camera parameters
         self.info_msg = None
         self.intrinsic_mat = None
         self.distortion = None
 
-        self.aruco_dictionary = cv2.aruco.Dictionary_get(dictionary_id)
-        self.aruco_parameters = cv2.aruco.DetectorParameters_create()
+        self.aruco_dictionary = cv2.aruco.getPredefinedDictionary(dictionary_id)
+        self.aruco_parameters = cv2.aruco.DetectorParameters()
         self.bridge = CvBridge()
 
     def info_callback(self, info_msg):
@@ -165,11 +184,12 @@ class ArucoNode(rclpy.node.Node):
         markers = ArucoMarkers()
         pose_array = PoseArray()
         if self.camera_frame == "":
-            markers.header.frame_id = self.info_msg.header.frame_id
-            pose_array.header.frame_id = self.info_msg.header.frame_id
+            frame_id = self.info_msg.header.frame_id
         else:
-            markers.header.frame_id = self.camera_frame
-            pose_array.header.frame_id = self.camera_frame
+            frame_id = self.camera_frame
+
+        markers.header.frame_id = frame_id
+        pose_array.header.frame_id = frame_id
 
         markers.header.stamp = img_msg.header.stamp
         pose_array.header.stamp = img_msg.header.stamp
@@ -186,27 +206,45 @@ class ArucoNode(rclpy.node.Node):
                 rvecs, tvecs = cv2.aruco.estimatePoseSingleMarkers(
                     corners, self.marker_size, self.intrinsic_mat, self.distortion
                 )
+
+            transforms = []
             for i, marker_id in enumerate(marker_ids):
+                marker_id_int = int(marker_id[0])
+
                 pose = Pose()
-                pose.position.x = tvecs[i][0][0]
-                pose.position.y = tvecs[i][0][1]
-                pose.position.z = tvecs[i][0][2]
+                pose.position.x = float(tvecs[i][0][0])
+                pose.position.y = float(tvecs[i][0][1])
+                pose.position.z = float(tvecs[i][0][2])
 
                 rot_matrix = np.eye(4)
                 rot_matrix[0:3, 0:3] = cv2.Rodrigues(np.array(rvecs[i][0]))[0]
                 quat = tf_transformations.quaternion_from_matrix(rot_matrix)
 
-                pose.orientation.x = quat[0]
-                pose.orientation.y = quat[1]
-                pose.orientation.z = quat[2]
-                pose.orientation.w = quat[3]
+                pose.orientation.x = float(quat[0])
+                pose.orientation.y = float(quat[1])
+                pose.orientation.z = float(quat[2])
+                pose.orientation.w = float(quat[3])
 
                 pose_array.poses.append(pose)
                 markers.poses.append(pose)
-                markers.marker_ids.append(marker_id[0])
+                markers.marker_ids.append(marker_id_int)
+
+                tf_msg = TransformStamped()
+                tf_msg.header.stamp = img_msg.header.stamp
+                tf_msg.header.frame_id = frame_id
+                tf_msg.child_frame_id = f"{self.marker_frame_prefix}{marker_id_int}"
+                tf_msg.transform.translation.x = pose.position.x
+                tf_msg.transform.translation.y = pose.position.y
+                tf_msg.transform.translation.z = pose.position.z
+                tf_msg.transform.rotation.x = pose.orientation.x
+                tf_msg.transform.rotation.y = pose.orientation.y
+                tf_msg.transform.rotation.z = pose.orientation.z
+                tf_msg.transform.rotation.w = pose.orientation.w
+                transforms.append(tf_msg)
 
             self.poses_pub.publish(pose_array)
             self.markers_pub.publish(markers)
+            self.tf_broadcaster.sendTransform(transforms)
 
 
 def main():
